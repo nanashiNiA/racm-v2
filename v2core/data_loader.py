@@ -6,10 +6,23 @@ import json, urllib.request
 
 sys.path.insert(0, 'C:/Users/A701/Documents/nia/prediction_model_project')
 
-def load_btc_1h():
-    """BTC 1H from local + API extension"""
+def load_btc_1h(cache_dir='C:/Users/A701/Documents/nia/prediction_model_project/data/cache'):
+    """BTC 1H from local + API extension. Cached."""
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_path = os.path.join(cache_dir, 'BTC_1h_combined.pkl')
+
     btc_h = pd.read_pickle('C:/Users/A701/Documents/nia/prediction_model_project/data/external/binance/btcusdt_hourly.pkl')
     btc_h.index = pd.to_datetime(btc_h.index)
+
+    # Load cache if recent (< 2 hours old)
+    if os.path.exists(cache_path):
+        import time
+        age_hours = (time.time() - os.path.getmtime(cache_path)) / 3600
+        if age_hours < 2:
+            btc_h = pd.read_pickle(cache_path)
+            btc_h['return'] = btc_h['close'].pct_change()
+            return btc_h.dropna(subset=['return'])
+
     # Extend with API
     rows = []; et = int(pd.Timestamp.now().timestamp() * 1000)
     for _ in range(20):
@@ -26,6 +39,8 @@ def load_btc_1h():
     if rows:
         api = pd.DataFrame(rows).drop_duplicates('timestamp').set_index('timestamp').sort_index()
         btc_h = pd.concat([btc_h, api[~api.index.isin(btc_h.index)]]).sort_index()
+
+    btc_h.to_pickle(cache_path)
     btc_h['return'] = btc_h['close'].pct_change()
     return btc_h.dropna(subset=['return'])
 
@@ -35,23 +50,93 @@ def load_derivatives():
     deriv.index = deriv.index.tz_localize(None)
     return deriv
 
-def load_6assets_8h(assets=['BTC','ETH','SOL','XRP','DOGE','LINK']):
-    """6 assets at 8H from API"""
+def load_6assets_8h(assets=['BTC','ETH','SOL','XRP','DOGE','LINK'], cache_dir='C:/Users/A701/Documents/nia/prediction_model_project/data/cache'):
+    """6 assets at 8H. Cache locally, only fetch new bars from API."""
+    os.makedirs(cache_dir, exist_ok=True)
     data = {}
     for sym in assets:
+        cache_path = os.path.join(cache_dir, f'{sym}_8h.pkl')
+        # Load cache if exists
+        if os.path.exists(cache_path):
+            cached = pd.read_pickle(cache_path)
+            # Only fetch bars AFTER the last cached bar
+            last_ts = int(cached.index[-1].timestamp() * 1000)
+            rows = []; et = int(pd.Timestamp.now().timestamp() * 1000)
+            for _ in range(5):  # only a few pages for new data
+                u = f'https://api.binance.com/api/v3/klines?symbol={sym}USDT&interval=8h&limit=1000&startTime={last_ts}'
+                try:
+                    with urllib.request.urlopen(urllib.request.Request(u, headers={'User-Agent':'V2'}), timeout=15) as r:
+                        d = json.loads(r.read())
+                except: break
+                if not d: break
+                for k in d: rows.append({'timestamp': pd.Timestamp(k[0], unit='ms'), 'close': float(k[4])})
+                if len(d) < 1000: break  # got all new bars
+                et = int(d[-1][0]) + 1
+            if rows:
+                new_df = pd.DataFrame(rows).drop_duplicates('timestamp').set_index('timestamp').sort_index()
+                new_df['close'] = new_df['close'].astype(float)
+                combined = pd.concat([cached, new_df[~new_df.index.isin(cached.index)]]).sort_index()
+                combined['return'] = combined['close'].pct_change()
+                combined = combined.dropna(subset=['return'])
+                combined.to_pickle(cache_path)
+                data[sym] = combined
+            else:
+                cached['return'] = cached['close'].pct_change()
+                data[sym] = cached.dropna(subset=['return'])
+        else:
+            # First time: full fetch
+            rows = []; et = int(pd.Timestamp.now().timestamp() * 1000)
+            for _ in range(25):
+                u = f'https://api.binance.com/api/v3/klines?symbol={sym}USDT&interval=8h&limit=1000&endTime={et}'
+                try:
+                    with urllib.request.urlopen(urllib.request.Request(u, headers={'User-Agent':'V2'}), timeout=15) as r:
+                        d = json.loads(r.read())
+                except: break
+                if not d: break
+                for k in d: rows.append({'timestamp': pd.Timestamp(k[0], unit='ms'), 'close': float(k[4])})
+                et = int(d[0][0]) - 1
+            df = pd.DataFrame(rows).drop_duplicates('timestamp').set_index('timestamp').sort_index()
+            df['close'] = df['close'].astype(float)
+            df['return'] = df['close'].pct_change()
+            df = df.dropna(subset=['return'])
+            df.to_pickle(cache_path)
+            data[sym] = df
+    return data
+
+def load_6assets_1h(assets=['BTC','ETH','SOL','XRP','DOGE','LINK'], cache_dir='C:/Users/A701/Documents/nia/prediction_model_project/data/cache'):
+    """6 assets at 1H. Cache locally. Full history."""
+    os.makedirs(cache_dir, exist_ok=True)
+    data = {}
+    for sym in assets:
+        cache_path = os.path.join(cache_dir, f'{sym}_1h.pkl')
+        if os.path.exists(cache_path):
+            import time
+            age_hours = (time.time() - os.path.getmtime(cache_path)) / 3600
+            if age_hours < 2:
+                data[sym] = pd.read_pickle(cache_path)
+                continue
+        # Full fetch (up to 80 pages)
+        print(f'  Fetching {sym} 1H...', end='', flush=True)
         rows = []; et = int(pd.Timestamp.now().timestamp() * 1000)
-        for _ in range(25):
-            u = f'https://api.binance.com/api/v3/klines?symbol={sym}USDT&interval=8h&limit=1000&endTime={et}'
+        for p in range(80):
+            u = f'https://api.binance.com/api/v3/klines?symbol={sym}USDT&interval=1h&limit=1000&endTime={et}'
             try:
                 with urllib.request.urlopen(urllib.request.Request(u, headers={'User-Agent':'V2'}), timeout=15) as r:
                     d = json.loads(r.read())
             except: break
             if not d: break
-            for k in d: rows.append({'timestamp': pd.Timestamp(k[0], unit='ms'), 'close': float(k[4])})
+            for k in d: rows.append({'timestamp': pd.Timestamp(k[0], unit='ms'),
+                'close': float(k[4]), 'high': float(k[2]), 'low': float(k[3]),
+                'open': float(k[1]), 'volume': float(k[5])})
             et = int(d[0][0]) - 1
+            if (p+1) % 20 == 0: print(f' {p+1}p', end='', flush=True)
         df = pd.DataFrame(rows).drop_duplicates('timestamp').set_index('timestamp').sort_index()
+        for col in ['close','high','low','open','volume']: df[col] = df[col].astype(float)
         df['return'] = df['close'].pct_change()
-        data[sym] = df.dropna()
+        df = df.dropna(subset=['return'])
+        df.to_pickle(cache_path)
+        data[sym] = df
+        print(f' {len(df)} bars ({df.index[0].date()} to {df.index[-1].date()})')
     return data
 
 def load_macro():
